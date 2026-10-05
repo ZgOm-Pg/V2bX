@@ -1,8 +1,8 @@
 package node
 
 import (
-	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/InazumaV/V2bX/api/panel"
 	"github.com/InazumaV/V2bX/common/task"
@@ -17,6 +17,7 @@ type Controller struct {
 	apiClient                 *panel.Client
 	tag                       string
 	limiter                   *limiter.Limiter
+	trafficMu                 sync.Mutex
 	traffic                   map[string]int64
 	userList                  []panel.UserInfo
 	aliveMap                  map[int]int
@@ -53,11 +54,17 @@ func (c *Controller) Start() error {
 		return fmt.Errorf("get user list error: %s", err)
 	}
 	if len(c.userList) == 0 {
-		return errors.New("add users error: not have any user")
+		// A freshly created node can legitimately have zero users. Start
+		// anyway; the node monitor adds users on its first pull, instead of
+		// failing Start and taking every other node on the instance down.
+		log.WithField("tag", c.tag).Warning("Node has no users yet, waiting for the monitor task to add them")
 	}
 	c.aliveMap, err = c.apiClient.GetUserAlive()
 	if err != nil {
-		return fmt.Errorf("failed to get user alive list: %s", err)
+		// The alive list only feeds device-limit accounting; a missing or
+		// broken endpoint must not keep the node offline.
+		log.WithField("tag", c.tag).Warningf("Failed to get user alive list, device limit accounting disabled: %s", err)
+		c.aliveMap = map[int]int{}
 	}
 	if len(c.Options.Name) == 0 {
 		c.tag = c.buildNodeTag(node)
@@ -124,4 +131,24 @@ func (c *Controller) Close() error {
 
 func (c *Controller) buildNodeTag(node *panel.NodeInfo) string {
 	return fmt.Sprintf("[%s]-%s:%d", c.apiClient.APIHost, node.Type, node.Id)
+}
+
+// resetTrafficCounter clears the per-user traffic accumulation used by the
+// dynamic speed limit. Guarded because SpeedChecker runs on its own goroutine.
+func (c *Controller) resetTrafficCounter() {
+	c.trafficMu.Lock()
+	c.traffic = make(map[string]int64)
+	c.trafficMu.Unlock()
+}
+
+// addTrafficCounter accumulates drained traffic (keyed by uuid) for the
+// dynamic speed limit; without this the map was never written and the
+// feature could never trigger.
+func (c *Controller) addTrafficCounter(uuid string, bytes int64) {
+	c.trafficMu.Lock()
+	if c.traffic == nil {
+		c.traffic = make(map[string]int64)
+	}
+	c.traffic[uuid] += bytes
+	c.trafficMu.Unlock()
 }

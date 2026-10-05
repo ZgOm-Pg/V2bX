@@ -73,22 +73,30 @@ func (h *Hysteria2) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTra
 		c.Counters.Range(func(key, value interface{}) bool {
 			uuid := key.(string)
 			traffic := value.(*counter.TrafficStorage)
-			up := traffic.UpCounter.Load()
-			down := traffic.DownCounter.Load()
+			// Swap(0) reads and clears atomically; a plain Load followed by
+			// Store(0) silently erased everything added in between.
+			up := traffic.UpCounter.Swap(0)
+			down := traffic.DownCounter.Swap(0)
+			if h.Auth.usersMap[uuid] == 0 {
+				// leftover counter of a removed user: drop it with its bytes
+				c.Delete(uuid)
+				return true
+			}
 			if up+down > hook.ReportMinTrafficBytes {
-				if reset {
-					traffic.UpCounter.Store(0)
-					traffic.DownCounter.Store(0)
-				}
-				if h.Auth.usersMap[uuid] == 0 {
-					c.Delete(uuid)
-					return true
+				if !reset {
+					traffic.UpCounter.Add(up)
+					traffic.DownCounter.Add(down)
 				}
 				trafficSlice = append(trafficSlice, panel.UserTraffic{
 					UID:      h.Auth.usersMap[uuid],
 					Upload:   up,
 					Download: down,
 				})
+			} else {
+				// below the reporting threshold: put the bytes back so they
+				// keep accumulating for a later cycle
+				traffic.UpCounter.Add(up)
+				traffic.DownCounter.Add(down)
 			}
 			return true
 		})
@@ -98,4 +106,31 @@ func (h *Hysteria2) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTra
 		return trafficSlice, nil
 	}
 	return nil, nil
+}
+
+// RestoreUserTraffic puts drained-but-unacknowledged traffic back into the
+// counters after a failed report, so the bytes are not lost for the next cycle.
+func (h *Hysteria2) RestoreUserTraffic(tag string, traffic []panel.UserTraffic) error {
+	h.Auth.mutex.RLock()
+	defer h.Auth.mutex.RUnlock()
+	if _, ok := h.Hy2nodes[tag]; !ok {
+		return nil
+	}
+	hook := h.Hy2nodes[tag].TrafficLogger.(*HookServer)
+	v, ok := hook.Counter.Load(tag)
+	if !ok {
+		return nil
+	}
+	c := v.(*counter.TrafficCounter)
+	for i := range traffic {
+		for uuid, uid := range h.Auth.usersMap {
+			if uid != traffic[i].UID {
+				continue
+			}
+			cts := c.GetCounter(uuid)
+			cts.UpCounter.Add(traffic[i].Upload)
+			cts.DownCounter.Add(traffic[i].Download)
+		}
+	}
+	return nil
 }

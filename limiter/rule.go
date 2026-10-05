@@ -4,6 +4,7 @@ import (
 	"regexp"
 
 	"github.com/InazumaV/V2bX/api/panel"
+	log "github.com/sirupsen/logrus"
 )
 
 func (l *Limiter) CheckDomainRule(destination string) (reject bool) {
@@ -28,10 +29,21 @@ func (l *Limiter) CheckProtocolRule(protocol string) (reject bool) {
 }
 
 func (l *Limiter) UpdateRule(rule *panel.Rules) error {
-	l.DomainRules = make([]*regexp.Regexp, len(rule.Regexp))
+	// Compile instead of MustCompile: panel-controlled rules must not be able
+	// to panic (and with no recover anywhere, crash) the process.
+	rules := make([]*regexp.Regexp, 0, len(rule.Regexp))
 	for i := range rule.Regexp {
-		l.DomainRules[i] = regexp.MustCompile(rule.Regexp[i])
+		re, err := regexp.Compile(rule.Regexp[i])
+		if err != nil {
+			log.WithFields(log.Fields{
+				"rule": rule.Regexp[i],
+				"err":  err,
+			}).Error("invalid regexp rule from panel, skipped")
+			continue
+		}
+		rules = append(rules, re)
 	}
+	l.DomainRules = rules
 	l.ProtocolRules = rule.Protocol
 	return nil
 }

@@ -395,7 +395,7 @@ func getInboundOptions(tag string, info *panel.NodeInfo, c *conf.Options) (optio
 }
 
 func (b *Sing) AddNode(tag string, info *panel.NodeInfo, config *conf.Options) error {
-	b.nodeReportMinTrafficBytes[tag] = config.ReportMinTraffic * 1024
+	b.setMinTraffic(tag, config.ReportMinTraffic*1024)
 	c, err := getInboundOptions(tag, info, config)
 	if err != nil {
 		return err
@@ -417,10 +417,29 @@ func (b *Sing) AddNode(tag string, info *panel.NodeInfo, config *conf.Options) e
 }
 
 func (b *Sing) DelNode(tag string) error {
+	b.delMinTraffic(tag)
 	in := b.box.Inbound()
 	err := in.Remove(tag)
 	if err != nil {
 		return fmt.Errorf("delete inbound error: %s", err)
 	}
 	return nil
+}
+
+func (b *Sing) setMinTraffic(tag string, bytes int64) {
+	b.minTrafficMu.Lock()
+	b.nodeReportMinTrafficBytes[tag] = bytes
+	b.minTrafficMu.Unlock()
+}
+
+func (b *Sing) getMinTraffic(tag string) int64 {
+	b.minTrafficMu.RLock()
+	defer b.minTrafficMu.RUnlock()
+	return b.nodeReportMinTrafficBytes[tag]
+}
+
+func (b *Sing) delMinTraffic(tag string) {
+	b.minTrafficMu.Lock()
+	delete(b.nodeReportMinTrafficBytes, tag)
+	b.minTrafficMu.Unlock()
 }

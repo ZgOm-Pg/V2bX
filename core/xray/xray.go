@@ -36,6 +36,7 @@ type Xray struct {
 	ohm                       outbound.Manager
 	dispatcher                *dispatcher.DefaultDispatcher
 	users                     *UserMap
+	minTrafficMu              sync.RWMutex
 	nodeReportMinTrafficBytes map[string]int64
 }
 

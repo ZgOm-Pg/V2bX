@@ -78,12 +78,17 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		return nil
 	}
 	if newN != nil {
+		// nodeInfo changed — keep the previous state so a failed reload can
+		// be rolled back instead of leaving the node down until the next
+		// panel-side change.
+		oldTag := c.tag
+		oldInfo := c.info
+		oldUserList := c.userList
 		c.info = newN
-		// nodeInfo changed
 		if newU != nil {
 			c.userList = newU
 		}
-		c.traffic = make(map[string]int64)
+		c.resetTrafficCounter()
 		// Remove old node
 		log.WithField("tag", c.tag).Info("Node changed, reload")
 		err = c.server.DelNode(c.tag)
@@ -91,23 +96,20 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
-			}).Panic("Delete node failed")
+			}).Error("Delete node failed")
+			c.info = oldInfo
+			c.userList = oldUserList
 			return nil
 		}
 
-		// Update limiter
+		// Update limiter. Always rebuild it: with a custom node name the tag
+		// never changes, so a stale limiter would keep rejecting newly added
+		// users. DeleteLimiter must target the OLD tag, not the new one.
 		if len(c.Options.Name) == 0 {
+			limiter.DeleteLimiter(oldTag)
 			c.tag = c.buildNodeTag(newN)
-			// Remove Old limiter
-			limiter.DeleteLimiter(c.tag)
-			// Add new Limiter
-			l := limiter.AddLimiter(c.tag, &c.LimitConfig, c.userList, newA)
-			c.limiter = l
 		}
-		// update alive list
-		if newA != nil {
-			c.limiter.AliveList = newA
-		}
+		c.limiter = limiter.AddLimiter(c.tag, &c.LimitConfig, c.userList, newA)
 		// Update rule
 		err = c.limiter.UpdateRule(&newN.Rules)
 		if err != nil {
@@ -115,6 +117,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				"tag": c.tag,
 				"err": err,
 			}).Error("Update Rule failed")
+			c.rollbackNodeReload(oldTag, oldInfo, oldUserList)
 			return nil
 		}
 
@@ -126,6 +129,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 					"tag": c.tag,
 					"err": err,
 				}).Error("Request cert failed")
+				c.rollbackNodeReload(oldTag, oldInfo, oldUserList)
 				return nil
 			}
 		}
@@ -135,7 +139,8 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
-			}).Panic("Add node failed")
+			}).Error("Add node failed")
+			c.rollbackNodeReload(oldTag, oldInfo, oldUserList)
 			return nil
 		}
 		_, err = c.server.AddUsers(&vCore.AddUsersParams{
@@ -148,20 +153,17 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				"tag": c.tag,
 				"err": err,
 			}).Error("Add users failed")
+			c.rollbackNodeReload(oldTag, oldInfo, oldUserList)
 			return nil
 		}
 		// Check interval
 		if c.nodeInfoMonitorPeriodic.Interval != newN.PullInterval &&
 			newN.PullInterval != 0 {
-			c.nodeInfoMonitorPeriodic.Interval = newN.PullInterval
-			c.nodeInfoMonitorPeriodic.Close()
-			_ = c.nodeInfoMonitorPeriodic.Start(false)
+			c.nodeInfoMonitorPeriodic.SetInterval(newN.PullInterval)
 		}
 		if c.userReportPeriodic.Interval != newN.PushInterval &&
 			newN.PushInterval != 0 {
-			c.userReportPeriodic.Interval = newN.PullInterval
-			c.userReportPeriodic.Close()
-			_ = c.userReportPeriodic.Start(false)
+			c.userReportPeriodic.SetInterval(newN.PushInterval)
 		}
 		log.WithField("tag", c.tag).Infof("Added %d new users", len(c.userList))
 		// exit
@@ -169,7 +171,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	}
 	// update alive list
 	if newA != nil {
-		c.limiter.AliveList = newA
+		c.limiter.SetAliveList(newA)
 	}
 	// node no changed, check users
 	if len(newU) == 0 {
@@ -214,9 +216,11 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		}
 		// clear traffic record
 		if c.LimitConfig.EnableDynamicSpeedLimit {
+			c.trafficMu.Lock()
 			for i := range deleted {
 				delete(c.traffic, deleted[i].Uuid)
 			}
+			c.trafficMu.Unlock()
 		}
 	}
 	c.userList = newU
@@ -227,14 +231,61 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	return nil
 }
 
+// rollbackNodeReload restores the previous node after a failed reload so it
+// keeps serving instead of staying down until the next panel-side change.
+func (c *Controller) rollbackNodeReload(oldTag string, oldInfo *panel.NodeInfo, oldUserList []panel.UserInfo) {
+	c.tag = oldTag
+	c.info = oldInfo
+	c.userList = oldUserList
+	c.limiter = limiter.AddLimiter(oldTag, &c.LimitConfig, oldUserList, nil)
+	if err := c.limiter.UpdateRule(&oldInfo.Rules); err != nil {
+		log.WithFields(log.Fields{
+			"tag": oldTag,
+			"err": err,
+		}).Error("Rollback: restore rules failed")
+	}
+	if err := c.server.AddNode(oldTag, oldInfo, c.Options); err != nil {
+		log.WithFields(log.Fields{
+			"tag": oldTag,
+			"err": err,
+		}).Error("Rollback: add old node failed")
+		return
+	}
+	if _, err := c.server.AddUsers(&vCore.AddUsersParams{
+		Tag:      oldTag,
+		Users:    oldUserList,
+		NodeInfo: oldInfo,
+	}); err != nil {
+		log.WithFields(log.Fields{
+			"tag": oldTag,
+			"err": err,
+		}).Error("Rollback: add old users failed")
+	}
+}
+
 func (c *Controller) SpeedChecker() error {
+	if c.traffic == nil {
+		return nil
+	}
+	// Snapshot and clear expired entries under the lock; the limiter update
+	// itself does network-free map lookups but keep it out of the lock anyway.
+	c.trafficMu.Lock()
+	over := make([]string, 0)
 	for u, t := range c.traffic {
 		if t >= c.LimitConfig.DynamicSpeedLimitConfig.Traffic {
-			err := c.limiter.UpdateDynamicSpeedLimit(c.tag, u,
-				c.LimitConfig.DynamicSpeedLimitConfig.SpeedLimit,
-				time.Now().Add(time.Duration(c.LimitConfig.DynamicSpeedLimitConfig.ExpireTime)*time.Minute))
-			log.WithField("err", err).Error("Update dynamic speed limit failed")
+			over = append(over, u)
 			delete(c.traffic, u)
+		}
+	}
+	c.trafficMu.Unlock()
+	for _, u := range over {
+		if err := c.limiter.UpdateDynamicSpeedLimit(c.tag, u,
+			c.LimitConfig.DynamicSpeedLimitConfig.SpeedLimit,
+			time.Now().Add(time.Duration(c.LimitConfig.DynamicSpeedLimitConfig.ExpireTime)*time.Minute)); err != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": err,
+			}).Error("Update dynamic speed limit failed")
 		}
 	}
 	return nil

@@ -18,6 +18,9 @@ type Core interface {
 	DelNode(tag string) error
 	AddUsers(p *AddUsersParams) (added int, err error)
 	GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraffic, error)
+	// RestoreUserTraffic adds drained-but-unacknowledged traffic back to the
+	// counters after a failed report, so no bytes are lost for the next cycle.
+	RestoreUserTraffic(tag string, traffic []panel.UserTraffic) error
 	DelUsers(users []panel.UserInfo, tag string, info *panel.NodeInfo) error
 	Protocols() []string
 	Type() string

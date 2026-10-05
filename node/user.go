@@ -10,8 +10,29 @@ import (
 func (c *Controller) reportUserTrafficTask() (err error) {
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, true)
 	if len(userTraffic) > 0 {
-		err = c.apiClient.ReportUserTraffic(userTraffic)
-		if err != nil {
+		// Accumulate for the dynamic speed limit regardless of the report
+		// result, keyed by uuid as SpeedChecker expects.
+		if c.LimitConfig.EnableDynamicSpeedLimit {
+			uidToUuid := make(map[int]string, len(c.userList))
+			for i := range c.userList {
+				uidToUuid[c.userList[i].Id] = c.userList[i].Uuid
+			}
+			for i := range userTraffic {
+				if uuid, ok := uidToUuid[userTraffic[i].UID]; ok {
+					c.addTrafficCounter(uuid, userTraffic[i].Upload+userTraffic[i].Download)
+				}
+			}
+		}
+		if err = c.apiClient.ReportUserTraffic(userTraffic); err != nil {
+			// The counters were already drained; put the bytes back so the
+			// failed report is retried with the next cycle instead of being
+			// silently lost.
+			if rerr := c.server.RestoreUserTraffic(c.tag, userTraffic); rerr != nil {
+				log.WithFields(log.Fields{
+					"tag": c.tag,
+					"err": rerr,
+				}).Error("Restore user traffic failed")
+			}
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,

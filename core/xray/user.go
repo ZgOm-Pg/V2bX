@@ -3,6 +3,7 @@ package xray
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/InazumaV/V2bX/api/panel"
 	"github.com/InazumaV/V2bX/common/counter"
@@ -63,25 +64,34 @@ func (x *Xray) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraffic,
 	defer x.users.mapLock.RUnlock()
 	if v, ok := x.dispatcher.Counter.Load(tag); ok {
 		c := v.(*counter.TrafficCounter)
+		minTraffic := x.getMinTraffic(tag)
 		c.Counters.Range(func(key, value interface{}) bool {
 			email := key.(string)
 			traffic := value.(*counter.TrafficStorage)
-			up := traffic.UpCounter.Load()
-			down := traffic.DownCounter.Load()
-			if up+down > x.nodeReportMinTrafficBytes[tag] {
-				if reset {
-					traffic.UpCounter.Store(0)
-					traffic.DownCounter.Store(0)
-				}
-				if x.users.uidMap[email] == 0 {
-					c.Delete(email)
-					return true
+			// Swap(0) reads and clears atomically; a plain Load followed by
+			// Store(0) silently erased everything added in between.
+			up := traffic.UpCounter.Swap(0)
+			down := traffic.DownCounter.Swap(0)
+			if x.users.uidMap[email] == 0 {
+				// leftover counter of a removed user: drop it with its bytes
+				c.Delete(email)
+				return true
+			}
+			if up+down > minTraffic {
+				if !reset {
+					traffic.UpCounter.Add(up)
+					traffic.DownCounter.Add(down)
 				}
 				trafficSlice = append(trafficSlice, panel.UserTraffic{
 					UID:      x.users.uidMap[email],
 					Upload:   up,
 					Download: down,
 				})
+			} else {
+				// below the reporting threshold: put the bytes back so they
+				// keep accumulating for a later cycle
+				traffic.UpCounter.Add(up)
+				traffic.DownCounter.Add(down)
 			}
 			return true
 		})
@@ -91,6 +101,30 @@ func (x *Xray) GetUserTrafficSlice(tag string, reset bool) ([]panel.UserTraffic,
 		return trafficSlice, nil
 	}
 	return nil, nil
+}
+
+// RestoreUserTraffic puts drained-but-unacknowledged traffic back into the
+// counters after a failed report, so the bytes are not lost for the next cycle.
+func (x *Xray) RestoreUserTraffic(tag string, traffic []panel.UserTraffic) error {
+	x.users.mapLock.RLock()
+	defer x.users.mapLock.RUnlock()
+	v, ok := x.dispatcher.Counter.Load(tag)
+	if !ok {
+		return nil
+	}
+	c := v.(*counter.TrafficCounter)
+	emailPrefix := tag + "|"
+	for i := range traffic {
+		for email, uid := range x.users.uidMap {
+			if uid != traffic[i].UID || !strings.HasPrefix(email, emailPrefix) {
+				continue
+			}
+			cts := c.GetCounter(email)
+			cts.UpCounter.Add(traffic[i].Upload)
+			cts.DownCounter.Add(traffic[i].Download)
+		}
+	}
+	return nil
 }
 
 func (c *Xray) AddUsers(p *vCore.AddUsersParams) (added int, err error) {

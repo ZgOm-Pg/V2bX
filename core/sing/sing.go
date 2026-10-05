@@ -31,6 +31,7 @@ type Sing struct {
 	router                    adapter.Router
 	logFactory                log.Factory
 	users                     *UserMap
+	minTrafficMu              sync.RWMutex
 	nodeReportMinTrafficBytes map[string]int64
 }
 

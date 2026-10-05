@@ -49,7 +49,11 @@ var logFormatMap = map[string]zapcore.EncoderConfig{
 func (l *serverLogger) Connect(addr net.Addr, uuid string, tx uint64) {
 	limiterinfo, err := limiter.GetLimiter(l.Tag)
 	if err != nil {
-		l.logger.Panic("Get limiter error", zap.String("tag", l.Tag), zap.Error(err))
+		// The limiter is briefly absent while a node is reloading. Logging and
+		// skipping the check keeps the connection alive instead of crashing
+		// the process through this per-connection hook.
+		l.logger.Error("Get limiter error", zap.String("tag", l.Tag), zap.Error(err))
+		return
 	}
 	if _, r := limiterinfo.CheckLimit(format.UserTag(l.Tag, uuid), extractIPFromAddr(addr), addr.Network() == "tcp", true); r {
 		if userLimit, ok := limiterinfo.UserLimitInfo.Load(format.UserTag(l.Tag, uuid)); ok {
@@ -70,7 +74,8 @@ func (l *serverLogger) Disconnect(addr net.Addr, uuid string, err error) {
 func (l *serverLogger) TCPRequest(addr net.Addr, uuid, reqAddr string) {
 	limiterinfo, err := limiter.GetLimiter(l.Tag)
 	if err != nil {
-		l.logger.Panic("Get limiter error", zap.String("tag", l.Tag), zap.Error(err))
+		l.logger.Error("Get limiter error", zap.String("tag", l.Tag), zap.Error(err))
+		return
 	}
 	if _, r := limiterinfo.CheckLimit(format.UserTag(l.Tag, uuid), extractIPFromAddr(addr), addr.Network() == "tcp", true); r {
 		if userLimit, ok := limiterinfo.UserLimitInfo.Load(format.UserTag(l.Tag, uuid)); ok {
@@ -95,7 +100,8 @@ func (l *serverLogger) TCPError(addr net.Addr, uuid, reqAddr string, err error) 
 func (l *serverLogger) UDPRequest(addr net.Addr, uuid string, sessionId uint32, reqAddr string) {
 	limiterinfo, err := limiter.GetLimiter(l.Tag)
 	if err != nil {
-		l.logger.Panic("Get limiter error", zap.String("tag", l.Tag), zap.Error(err))
+		l.logger.Error("Get limiter error", zap.String("tag", l.Tag), zap.Error(err))
+		return
 	}
 	if _, r := limiterinfo.CheckLimit(format.UserTag(l.Tag, uuid), extractIPFromAddr(addr), addr.Network() == "tcp", true); r {
 		if userLimit, ok := limiterinfo.UserLimitInfo.Load(format.UserTag(l.Tag, uuid)); ok {

@@ -29,6 +29,7 @@ type Limiter struct {
 	UUIDtoUID     map[string]int // Key: UUID, value: Uid
 	UserLimitInfo *sync.Map      // Key: TagUUID value: UserLimitInfo
 	SpeedLimiter  *sync.Map      // key: TagUUID, value: *ratelimit.Bucket
+	aliveMu       sync.RWMutex   // guards AliveList
 	AliveList     map[int]int    // Key: Uid, value: alive_ip
 }
 
@@ -87,13 +88,23 @@ func DeleteLimiter(tag string) {
 	limitLock.Unlock()
 }
 
+// SetAliveList atomically replaces the alive-ip list; the node monitor swaps
+// it while per-connection limit checks are reading the old one.
+func (l *Limiter) SetAliveList(aliveList map[int]int) {
+	l.aliveMu.Lock()
+	l.AliveList = aliveList
+	l.aliveMu.Unlock()
+}
+
 func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel.UserInfo) {
 	for i := range deleted {
 		l.UserLimitInfo.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.UserOnlineIP.Delete(format.UserTag(tag, deleted[i].Uuid))
 		l.SpeedLimiter.Delete(format.UserTag(tag, deleted[i].Uuid))
 		delete(l.UUIDtoUID, deleted[i].Uuid)
+		l.aliveMu.Lock()
 		delete(l.AliveList, deleted[i].Id)
+		l.aliveMu.Unlock()
 	}
 	for i := range added {
 		userLimit := &UserLimitInfo{
@@ -154,7 +165,9 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 		// Store online user for device limit
 		newipMap := new(sync.Map)
 		newipMap.Store(ip, uid)
+		l.aliveMu.RLock()
 		aliveIp := l.AliveList[uid]
+		l.aliveMu.RUnlock()
 		// If any device is online
 		if v, loaded := l.UserOnlineIP.LoadOrStore(taguuid, newipMap); loaded {
 			oldipMap := v.(*sync.Map)

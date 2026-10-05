@@ -17,7 +17,7 @@ type DNSConfig struct {
 }
 
 func (c *Xray) AddNode(tag string, info *panel.NodeInfo, config *conf.Options) error {
-	c.nodeReportMinTrafficBytes[tag] = config.ReportMinTraffic * 1024
+	c.setMinTraffic(tag, config.ReportMinTraffic*1024)
 	err := updateDNSConfig(info)
 	if err != nil {
 		return fmt.Errorf("build dns error: %s", err)
@@ -72,6 +72,7 @@ func (c *Xray) addOutbound(config *core.OutboundHandlerConfig) error {
 }
 
 func (c *Xray) DelNode(tag string) error {
+	c.delMinTraffic(tag)
 	err := c.removeInbound(tag)
 	if err != nil {
 		return fmt.Errorf("remove in error: %s", err)
@@ -81,6 +82,24 @@ func (c *Xray) DelNode(tag string) error {
 		return fmt.Errorf("remove out error: %s", err)
 	}
 	return nil
+}
+
+func (c *Xray) setMinTraffic(tag string, bytes int64) {
+	c.minTrafficMu.Lock()
+	c.nodeReportMinTrafficBytes[tag] = bytes
+	c.minTrafficMu.Unlock()
+}
+
+func (c *Xray) getMinTraffic(tag string) int64 {
+	c.minTrafficMu.RLock()
+	defer c.minTrafficMu.RUnlock()
+	return c.nodeReportMinTrafficBytes[tag]
+}
+
+func (c *Xray) delMinTraffic(tag string) {
+	c.minTrafficMu.Lock()
+	delete(c.nodeReportMinTrafficBytes, tag)
+	c.minTrafficMu.Unlock()
 }
 
 func (c *Xray) removeInbound(tag string) error {
