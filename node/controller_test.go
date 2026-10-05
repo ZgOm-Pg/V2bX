@@ -20,6 +20,19 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// chainChild is the child core behind the real Selector used by
+// TestRollbackThroughSelectorCleansPartialNode.
+var chainChild *fakeCore
+
+func init() {
+	vCore.RegisterCore("faketest", func(c *conf.CoreConfig) (vCore.Core, error) {
+		if chainChild == nil {
+			chainChild = newFakeCore()
+		}
+		return chainChild, nil
+	})
+}
+
 // ---- fake core ----
 
 type fakeCore struct {
@@ -27,6 +40,7 @@ type fakeCore struct {
 	nodes            map[string]*panel.NodeInfo
 	users            map[string]map[string]bool
 	failAddUsersPort int
+	failAddNodePort  int
 	traffic          map[string]int64
 	restored         int
 }
@@ -47,6 +61,13 @@ func (f *fakeCore) Protocols() []string { return []string{"shadowsocks"} }
 func (f *fakeCore) AddNode(tag string, info *panel.NodeInfo, config *conf.Options) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failAddNodePort != 0 && info != nil && info.Common != nil &&
+		info.Common.ServerPort == f.failAddNodePort {
+		// simulate a partially created node before failing (xray adds the
+		// inbound and then fails on the outbound)
+		f.nodes[tag] = info
+		return fmt.Errorf("simulated add node failure for port %d", f.failAddNodePort)
+	}
 	if _, exists := f.nodes[tag]; exists {
 		return fmt.Errorf("duplicate inbound: %s", tag)
 	}
@@ -208,7 +229,7 @@ func (fp *fakePanel) setNodePort(port int) {
 
 // ---- controller assembly ----
 
-func newTestController(t *testing.T, fp *fakePanel, core *fakeCore, opts func(*conf.Options)) *Controller {
+func newTestController(t *testing.T, fp *fakePanel, server vCore.Core, opts func(*conf.Options)) *Controller {
 	t.Helper()
 	api, err := panel.New(&conf.ApiConfig{
 		APIHost:  fp.srv.URL,
@@ -223,7 +244,7 @@ func newTestController(t *testing.T, fp *fakePanel, core *fakeCore, opts func(*c
 	if opts != nil {
 		opts(o)
 	}
-	c := NewController(core, api, o)
+	c := NewController(server, api, o)
 	if err := c.Start(); err != nil {
 		t.Fatalf("controller start: %s", err)
 	}
@@ -278,7 +299,8 @@ func TestDynamicSpeedLimitTaskStartedAndTriggers(t *testing.T) {
 		if !ok {
 			return false
 		}
-		return v.(*limiter.UserLimitInfo).DynamicSpeedLimit == 2048
+		dyn, _ := v.(*limiter.UserLimitInfo).DynamicState()
+		return dyn == 2048
 	})
 }
 
@@ -381,6 +403,55 @@ func TestRollbackAfterAddUsersFailureSameTag(t *testing.T) {
 	}
 	if got := core.userCount(c.tag); got != 1 {
 		t.Fatalf("users in core after rollback = %d, want 1", got)
+	}
+	if c.info == nil || c.info.Common == nil || c.info.Common.ServerPort != 12344 {
+		t.Fatalf("controller info does not match rolled back node: %+v", c.info)
+	}
+}
+
+// End-to-end rollback through a real Selector: when the child core's AddNode
+// fails after partially creating the node, the Selector must clean the child
+// up (the tag mapping is never stored) and the controller rollback must still
+// restore the old node.
+func TestRollbackThroughSelectorCleansPartialNode(t *testing.T) {
+	fp := newFakePanel(t)
+	chainChild = newFakeCore()
+	sel, err := vCore.NewSelector([]conf.CoreConfig{{Type: "faketest", Name: "faketest"}})
+	if err != nil {
+		t.Fatalf("NewSelector: %s", err)
+	}
+	c := newTestController(t, fp, sel, func(o *conf.Options) {
+		o.CoreName = "faketest"
+		o.Core = "faketest"
+	})
+	chainChild.mu.Lock()
+	chainChild.failAddNodePort = 12345
+	chainChild.mu.Unlock()
+
+	oldTag := c.tag
+	fp.setNodePort(12345)
+	c.nodeInfoMonitor()
+
+	if chainChild.nodes == nil {
+		t.Fatal("child core missing")
+	}
+	// the partially created new node must have been cleaned from the child
+	chainChild.mu.Lock()
+	_, leaked := chainChild.nodes[oldTag+"_"]
+	leakedByPort := false
+	for tag, n := range chainChild.nodes {
+		if n != nil && n.Common != nil && n.Common.ServerPort == 12345 {
+			leakedByPort = true
+			_ = tag
+		}
+	}
+	chainChild.mu.Unlock()
+	if leaked || leakedByPort {
+		t.Fatal("partially created new node left in child core after failed reload")
+	}
+	port, ok := chainChild.nodePort(oldTag)
+	if !ok || port != 12344 {
+		t.Fatalf("old node not restored through Selector (exists=%v port=%d)", ok, port)
 	}
 	if c.info == nil || c.info.Common == nil || c.info.Common.ServerPort != 12344 {
 		t.Fatalf("controller info does not match rolled back node: %+v", c.info)

@@ -34,12 +34,57 @@ type Limiter struct {
 }
 
 type UserLimitInfo struct {
-	UID               int
-	SpeedLimit        int
-	DeviceLimit       int
+	UID         int
+	SpeedLimit  int
+	DeviceLimit int
+	// mu guards the fields below: UpdateDynamicSpeedLimit (report task),
+	// CheckLimit (per-connection) and the hy2 hooks run on different
+	// goroutines and all touch them. UID/SpeedLimit/DeviceLimit are only
+	// written before the entry becomes visible in UserLimitInfo, so they are
+	// effectively immutable.
+	mu                sync.RWMutex
 	DynamicSpeedLimit int
 	ExpireTime        int64
 	OverLimit         bool
+}
+
+// SetDynamic stores a new dynamic limit and its expiry (unix seconds).
+func (u *UserLimitInfo) SetDynamic(limit int, expire int64) {
+	u.mu.Lock()
+	u.DynamicSpeedLimit = limit
+	u.ExpireTime = expire
+	u.mu.Unlock()
+}
+
+// ExpireDynamic revokes the dynamic restriction and restores the base policy.
+func (u *UserLimitInfo) ExpireDynamic() {
+	u.mu.Lock()
+	u.DynamicSpeedLimit = 0
+	u.ExpireTime = 0
+	u.mu.Unlock()
+}
+
+// DynamicState returns the current dynamic limit and expiry (unix seconds).
+func (u *UserLimitInfo) DynamicState() (int, int64) {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.DynamicSpeedLimit, u.ExpireTime
+}
+
+// SetOverLimit records whether the connection layer flagged the user.
+func (u *UserLimitInfo) SetOverLimit(b bool) {
+	u.mu.Lock()
+	u.OverLimit = b
+	u.mu.Unlock()
+}
+
+// TakeOverLimit reads and clears the over-limit flag (hy2 LogTraffic).
+func (u *UserLimitInfo) TakeOverLimit() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	v := u.OverLimit
+	u.OverLimit = false
+	return v
 }
 
 func AddLimiter(tag string, l *conf.LimitConfig, users []panel.UserInfo, aliveList map[int]int) *Limiter {
@@ -125,9 +170,7 @@ func (l *Limiter) UpdateUser(tag string, added []panel.UserInfo, deleted []panel
 
 func (l *Limiter) UpdateDynamicSpeedLimit(tag, uuid string, limit int, expire time.Time) error {
 	if v, ok := l.UserLimitInfo.Load(format.UserTag(tag, uuid)); ok {
-		info := v.(*UserLimitInfo)
-		info.DynamicSpeedLimit = limit
-		info.ExpireTime = expire.Unix()
+		v.(*UserLimitInfo).SetDynamic(limit, expire.Unix())
 	} else {
 		return errors.New("not found")
 	}
@@ -147,16 +190,16 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 		u := v.(*UserLimitInfo)
 		deviceLimit = u.DeviceLimit
 		uid = u.UID
-		if u.ExpireTime < time.Now().Unix() && u.ExpireTime != 0 {
-			if u.SpeedLimit != 0 {
-				userLimit = u.SpeedLimit
-				u.DynamicSpeedLimit = 0
-				u.ExpireTime = 0
-			} else {
-				l.UserLimitInfo.Delete(taguuid)
-			}
+		dyn, exp := u.DynamicState()
+		if exp != 0 && exp < time.Now().Unix() {
+			// Expired dynamic limit: revoke only the dynamic restriction and
+			// fall back to the base policy. The user entry must survive —
+			// deleting it locked a still-valid user (SpeedLimit == 0) out of
+			// the node on their next connection.
+			u.ExpireDynamic()
+			userLimit = u.SpeedLimit
 		} else {
-			userLimit = determineSpeedLimit(u.SpeedLimit, u.DynamicSpeedLimit)
+			userLimit = determineSpeedLimit(u.SpeedLimit, dyn)
 		}
 	} else {
 		return nil, true
@@ -200,16 +243,24 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 
 	limit := int64(determineSpeedLimit(nodeLimit, userLimit)) * 1000000 / 8 // If you need the Speed limit
 	if limit > 0 {
-		Bucket = ratelimit.NewBucketWithQuantum(time.Second, limit, limit) // Byte/s
-		if v, ok := l.SpeedLimiter.LoadOrStore(taguuid, Bucket); ok {
-			return v.(*ratelimit.Bucket), false
-		} else {
-			l.SpeedLimiter.Store(taguuid, Bucket)
-			return Bucket, false
+		// Reuse the existing bucket only when the rate is unchanged; when the
+		// limit changed (dynamic limit activated or expired) the stale bucket
+		// must be replaced, otherwise the new rate never took effect.
+		// Semantics: connections that already hold the old bucket pointer keep
+		// the old rate until their next CheckLimit call; every new or
+		// re-checking connection immediately gets the current rate.
+		if v, ok := l.SpeedLimiter.Load(taguuid); ok {
+			if old, isBucket := v.(*ratelimit.Bucket); isBucket && int64(old.Rate()) == limit {
+				return old, false
+			}
 		}
-	} else {
-		return nil, false
+		Bucket = ratelimit.NewBucketWithQuantum(time.Second, limit, limit) // Byte/s
+		l.SpeedLimiter.Store(taguuid, Bucket)
+		return Bucket, false
 	}
+	// Unlimited now: drop any stale bucket so a later limit change takes effect.
+	l.SpeedLimiter.Delete(taguuid)
+	return nil, false
 }
 
 func (l *Limiter) GetOnlineDevice() (*[]panel.OnlineUser, error) {

@@ -2,6 +2,7 @@ package hy2
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/InazumaV/V2bX/api/panel"
@@ -135,11 +136,13 @@ func TestRestoreUserTrafficAddsBack(t *testing.T) {
 	}
 }
 
-// concurrent drain and accumulate must not lose or duplicate bytes
+// concurrent drain and accumulate must not lose or duplicate bytes: the sum
+// of everything drained plus what remains must equal what was written
 func TestConcurrentDrainAndAdd(t *testing.T) {
 	h, hook := newTestHysteria2(0)
 	seed(hook, "u1", 0, 0)
 
+	var drained atomic.Int64
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -152,21 +155,24 @@ func TestConcurrentDrainAndAdd(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 20; i++ {
-			_, _ = h.GetUserTrafficSlice("t", true)
+			traffic, _ := h.GetUserTrafficSlice("t", true)
+			for _, tr := range traffic {
+				drained.Add(tr.Upload + tr.Download)
+			}
 		}
 	}()
 	wg.Wait()
 
-	// drained + still-counted bytes must equal the 200 bytes written
-	var drained int64
+	// collect whatever is still in the counters after the concurrent phase
+	total := drained.Load()
 	for i := 0; i < 5; i++ {
 		traffic, _ := h.GetUserTrafficSlice("t", true)
 		for _, tr := range traffic {
-			drained += tr.Upload + tr.Download
+			total += tr.Upload + tr.Download
 		}
 	}
 	up, down := rawCount(t, hook, "u1")
-	if drained+up+down != 200 {
-		t.Fatalf("lost traffic: drained=%d remaining=%d/%d, want sum 200", drained, up, down)
+	if total+up+down != 200 {
+		t.Fatalf("traffic not conserved: drained=%d remaining=%d/%d, want sum 200", total, up, down)
 	}
 }

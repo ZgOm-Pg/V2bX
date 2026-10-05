@@ -1,18 +1,23 @@
 package node
 
 import (
-	"log"
 	"os"
 	"testing"
 
 	"github.com/InazumaV/V2bX/conf"
 )
 
-var l *Lego
-
-func init() {
-	var err error
-	l, err = NewLego(&conf.CertConfig{
+// TestLego_CreateCertByDns and TestLego_RenewCert talk to the real Let's
+// Encrypt ACME API and need valid Cloudflare credentials. They are opt-in
+// integration tests: set V2BX_LEGO_E2E=1 to run them. Plain unit tests must
+// never touch the network — the old init() registered a real ACME account at
+// package load time, which -skip could not prevent.
+func newE2ELego(t *testing.T) *Lego {
+	t.Helper()
+	if os.Getenv("V2BX_LEGO_E2E") == "" {
+		t.Skip("set V2BX_LEGO_E2E=1 to run the ACME integration tests")
+	}
+	l, err := NewLego(&conf.CertConfig{
 		CertMode:   "dns",
 		Email:      "test@test.com",
 		CertDomain: "test.test.com",
@@ -24,18 +29,19 @@ func init() {
 		KeyFile:  "./cert/1.key",
 	})
 	if err != nil {
-		log.Println(err)
-		os.Exit(1)
+		t.Fatalf("NewLego: %s", err)
 	}
+	return l
 }
 
 func TestLego_CreateCertByDns(t *testing.T) {
-	err := l.CreateCert()
-	if err != nil {
+	l := newE2ELego(t)
+	if err := l.CreateCert(); err != nil {
 		t.Error(err)
 	}
 }
 
 func TestLego_RenewCert(t *testing.T) {
-	log.Println(l.RenewCert())
+	l := newE2ELego(t)
+	t.Log(l.RenewCert())
 }

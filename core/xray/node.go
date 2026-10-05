@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/InazumaV/V2bX/api/panel"
@@ -73,15 +74,12 @@ func (c *Xray) addOutbound(config *core.OutboundHandlerConfig) error {
 
 func (c *Xray) DelNode(tag string) error {
 	c.delMinTraffic(tag)
-	err := c.removeInbound(tag)
-	if err != nil {
-		return fmt.Errorf("remove in error: %s", err)
-	}
-	err = c.removeOutbound(tag)
-	if err != nil {
-		return fmt.Errorf("remove out error: %s", err)
-	}
-	return nil
+	// Attempt both removals even when one side is missing: AddNode can fail
+	// halfway (inbound added, outbound not, or the reverse) and the leftover
+	// half must not survive the cleanup.
+	inErr := c.removeInbound(tag)
+	outErr := c.removeOutbound(tag)
+	return errors.Join(inErr, outErr)
 }
 
 func (c *Xray) setMinTraffic(tag string, bytes int64) {

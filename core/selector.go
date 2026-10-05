@@ -99,6 +99,14 @@ func (s *Selector) AddNode(tag string, info *panel.NodeInfo, option *conf.Option
 	}
 	err := core.AddNode(tag, info, option)
 	if err != nil {
+		// The child core may have created resources before failing (xray
+		// adds the inbound, then fails building/adding the outbound). No
+		// tag mapping is stored for a failed AddNode, so a later DelNode
+		// would report "the node is not have" and never clean the child
+		// core up; the Selector must trigger the cleanup itself.
+		if delErr := core.DelNode(tag); delErr != nil {
+			return fmt.Errorf("add node: %s; cleanup: %s", err, delErr)
+		}
 		return err
 	}
 	s.nodes.Store(tag, core)
