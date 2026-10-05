@@ -89,6 +89,15 @@ func (s *Selector) AddNode(tag string, info *panel.NodeInfo, option *conf.Option
 	if core == nil {
 		return errors.New("the node type is not support")
 	}
+	// A tag that is already registered must be rejected before calling the
+	// child core: a duplicate AddNode fails inside the child before creating
+	// anything, and the failure-triggered cleanup below would otherwise tear
+	// down the healthy original node (its listener disappears while the
+	// mapping stays). Only tags without a mapping can be leftovers of a
+	// partially failed AddNode, which the cleanup is for.
+	if _, exists := s.nodes.Load(tag); exists {
+		return errors.New("the node tag is already registered")
+	}
 	if len(option.Core) == 0 {
 		option.Core = core.Type()
 		err := option.UnmarshalJSON(option.RawOptions)

@@ -28,9 +28,10 @@ type Limiter struct {
 	OldUserOnline *sync.Map      // Key: Ip, value: Uid
 	UUIDtoUID     map[string]int // Key: UUID, value: Uid
 	UserLimitInfo *sync.Map      // Key: TagUUID value: UserLimitInfo
-	SpeedLimiter  *sync.Map      // key: TagUUID, value: *ratelimit.Bucket
 	aliveMu       sync.RWMutex   // guards AliveList
 	AliveList     map[int]int    // Key: Uid, value: alive_ip
+	bucketMu      sync.Mutex     // serializes SpeedLimiter get-or-create/replace
+	SpeedLimiter  *sync.Map      // key: TagUUID, value: *ratelimit.Bucket
 }
 
 type UserLimitInfo struct {
@@ -242,13 +243,14 @@ func (l *Limiter) CheckLimit(taguuid string, ip string, isTcp bool, noSSUDP bool
 	}
 
 	limit := int64(determineSpeedLimit(nodeLimit, userLimit)) * 1000000 / 8 // If you need the Speed limit
+	// Creating and replacing buckets is serialized: Load→create→Store racing
+	// across connections handed every racing connection its own bucket, so
+	// the user's total rate limit was not shared. Existing connections keep
+	// their old bucket pointer until their next CheckLimit call; every new
+	// or re-checking connection immediately gets the current rate.
+	l.bucketMu.Lock()
+	defer l.bucketMu.Unlock()
 	if limit > 0 {
-		// Reuse the existing bucket only when the rate is unchanged; when the
-		// limit changed (dynamic limit activated or expired) the stale bucket
-		// must be replaced, otherwise the new rate never took effect.
-		// Semantics: connections that already hold the old bucket pointer keep
-		// the old rate until their next CheckLimit call; every new or
-		// re-checking connection immediately gets the current rate.
 		if v, ok := l.SpeedLimiter.Load(taguuid); ok {
 			if old, isBucket := v.(*ratelimit.Bucket); isBucket && int64(old.Rate()) == limit {
 				return old, false

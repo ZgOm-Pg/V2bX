@@ -10,6 +10,7 @@ import (
 	"github.com/InazumaV/V2bX/api/panel"
 	"github.com/InazumaV/V2bX/common/format"
 	"github.com/InazumaV/V2bX/conf"
+	"github.com/juju/ratelimit"
 )
 
 func TestMain(m *testing.M) {
@@ -79,6 +80,117 @@ func TestBucketRateFollowsLimitChanges(t *testing.T) {
 	b3, _ := l.CheckLimit(taguuid, "1.2.3.4", true, true)
 	if got := int64(b3.Rate()); got != 1250000 {
 		t.Fatalf("bucket rate after expiry = %d B/s, want 1250000", got)
+	}
+}
+
+// Concurrent connections of the same user with an unchanged limit policy
+// must all share ONE bucket pointer: the Load→create→Store sequence in
+// CheckLimit lets racing connections return their own buckets, so the
+// user's total rate limit is not enforced across connections. The race
+// window is narrow; repeat bursts with a cleared cache to hit it.
+func TestConcurrentCheckLimitSharesSingleBucket(t *testing.T) {
+	l, _, taguuid := newTestLimiter(10)
+
+	const n = 128
+	const bursts = 50
+	for round := 0; round < bursts; round++ {
+		l.SpeedLimiter.Delete(taguuid) // clear the cache: fresh creation race
+		buckets := make([]*ratelimit.Bucket, n)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				b, reject := l.CheckLimit(taguuid, "1.2.3.4", true, true)
+				if reject || b == nil {
+					t.Errorf("round %d: connection %d rejected or got no bucket", round, i)
+					return
+				}
+				buckets[i] = b
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		uniq := make(map[*ratelimit.Bucket]bool, n)
+		for _, b := range buckets {
+			if b != nil {
+				uniq[b] = true
+			}
+		}
+		if len(uniq) != 1 {
+			t.Fatalf("round %d: got %d distinct buckets for one user under concurrency, want 1", round, len(uniq))
+		}
+	}
+}
+
+// Bucket replacement on limit changes must also be coordinated: during each
+// stable policy phase all concurrent connections share one bucket, and the
+// bucket actually changes when the policy changes.
+func TestBucketReplacedOnLimitChangeConcurrently(t *testing.T) {
+	l, tag, taguuid := newTestLimiter(10)
+
+	burst := func() *ratelimit.Bucket {
+		t.Helper()
+		const n = 32
+		buckets := make([]*ratelimit.Bucket, n)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				b, reject := l.CheckLimit(taguuid, "1.2.3.4", true, true)
+				if reject || b == nil {
+					t.Errorf("connection %d rejected or got no bucket", i)
+					return
+				}
+				buckets[i] = b
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		uniq := make(map[*ratelimit.Bucket]bool, n)
+		for _, b := range buckets {
+			uniq[b] = true
+		}
+		if len(uniq) != 1 {
+			t.Fatalf("got %d distinct buckets in one burst, want 1", len(uniq))
+		}
+		for b := range uniq {
+			return b
+		}
+		return nil
+	}
+
+	b1 := burst()
+	if got := int64(b1.Rate()); got != 1250000 {
+		t.Fatalf("base bucket rate = %d B/s, want 1250000", got)
+	}
+
+	if err := l.UpdateDynamicSpeedLimit(tag, "u1", 1, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	b2 := burst()
+	if got := int64(b2.Rate()); got != 125000 {
+		t.Fatalf("bucket rate after dynamic limit = %d B/s, want 125000", got)
+	}
+	if b2 == b1 {
+		t.Fatal("bucket was not replaced after the limit changed")
+	}
+
+	if err := l.UpdateDynamicSpeedLimit(tag, "u1", 1, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	b3 := burst()
+	if got := int64(b3.Rate()); got != 1250000 {
+		t.Fatalf("bucket rate after expiry = %d B/s, want 1250000", got)
+	}
+	if b3 == b2 {
+		t.Fatal("bucket was not replaced after the dynamic limit expired")
 	}
 }
 

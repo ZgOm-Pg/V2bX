@@ -86,6 +86,40 @@ func TestSelectorCleansUpAfterFailedAddNode(t *testing.T) {
 	}
 }
 
+// A tag that is already registered must be rejected without touching the
+// child core: a duplicate AddNode fails inside the child before creating
+// anything, and the old unconditional cleanup deleted the healthy original
+// node (its listener disappeared, while the mapping stayed).
+func TestSelectorRejectsDuplicateTagWithoutCleanup(t *testing.T) {
+	child := newStubCore()
+	sel := &Selector{cores: map[string]Core{"stub": child}}
+	opts := &conf.Options{CoreName: "stub", Core: "stub"}
+
+	if err := sel.AddNode("tag1", &panel.NodeInfo{}, opts); err != nil {
+		t.Fatalf("initial AddNode: %s", err)
+	}
+	child.addNodeErr = errors.New("add inbound error: existing tag found")
+
+	if err := sel.AddNode("tag1", &panel.NodeInfo{}, opts); err == nil {
+		t.Fatal("duplicate AddNode must be rejected")
+	}
+	if !child.nodes["tag1"] {
+		t.Fatal("original node was deleted by the duplicate-add handling")
+	}
+	found := false
+	for _, d := range child.delNodes {
+		if d == "tag1" {
+			found = true
+		}
+	}
+	if found {
+		t.Fatal("DelNode was called on the healthy original node")
+	}
+	if _, ok := sel.nodes.Load("tag1"); !ok {
+		t.Fatal("mapping for the original node was lost")
+	}
+}
+
 func TestSelectorAddDelNodeSuccessPath(t *testing.T) {
 	child := newStubCore()
 	sel := &Selector{cores: map[string]Core{"stub": child}}
