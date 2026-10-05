@@ -45,7 +45,11 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 			Interval: time.Duration(c.LimitConfig.DynamicSpeedLimitConfig.Periodic) * time.Second,
 			Execute:  c.SpeedChecker,
 		}
-		log.Printf("[%s: %d] Start dynamic speed limit", c.apiClient.NodeType, c.apiClient.NodeId)
+		if err := c.dynamicSpeedLimitPeriodic.Start(false); err != nil {
+			log.Printf("[%s: %d] Start dynamic speed limit task failed: %s", c.apiClient.NodeType, c.apiClient.NodeId, err)
+		} else {
+			log.Printf("[%s: %d] Start dynamic speed limit", c.apiClient.NodeType, c.apiClient.NodeId)
+		}
 	}
 }
 
@@ -117,7 +121,9 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				"tag": c.tag,
 				"err": err,
 			}).Error("Update Rule failed")
-			c.rollbackNodeReload(oldTag, oldInfo, oldUserList)
+			if rbErr := c.rollbackNodeReload(oldTag, oldInfo, oldUserList, false); rbErr != nil {
+				log.WithFields(log.Fields{"tag": oldTag, "err": rbErr}).Error("Node rollback failed")
+			}
 			return nil
 		}
 
@@ -129,7 +135,9 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 					"tag": c.tag,
 					"err": err,
 				}).Error("Request cert failed")
-				c.rollbackNodeReload(oldTag, oldInfo, oldUserList)
+				if rbErr := c.rollbackNodeReload(oldTag, oldInfo, oldUserList, false); rbErr != nil {
+					log.WithFields(log.Fields{"tag": oldTag, "err": rbErr}).Error("Node rollback failed")
+				}
 				return nil
 			}
 		}
@@ -140,7 +148,11 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				"tag": c.tag,
 				"err": err,
 			}).Error("Add node failed")
-			c.rollbackNodeReload(oldTag, oldInfo, oldUserList)
+			// AddNode can fail halfway (e.g. inbound added, outbound not);
+			// the rollback removes whatever was created for the new tag.
+			if rbErr := c.rollbackNodeReload(oldTag, oldInfo, oldUserList, true); rbErr != nil {
+				log.WithFields(log.Fields{"tag": oldTag, "err": rbErr}).Error("Node rollback failed")
+			}
 			return nil
 		}
 		_, err = c.server.AddUsers(&vCore.AddUsersParams{
@@ -153,7 +165,9 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				"tag": c.tag,
 				"err": err,
 			}).Error("Add users failed")
-			c.rollbackNodeReload(oldTag, oldInfo, oldUserList)
+			if rbErr := c.rollbackNodeReload(oldTag, oldInfo, oldUserList, true); rbErr != nil {
+				log.WithFields(log.Fields{"tag": oldTag, "err": rbErr}).Error("Node rollback failed")
+			}
 			return nil
 		}
 		// Check interval
@@ -173,8 +187,10 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	if newA != nil {
 		c.limiter.SetAliveList(newA)
 	}
-	// node no changed, check users
-	if len(newU) == 0 {
+	// node not changed; nil means the panel reported no update (304), so the
+	// current user set stays valid. A non-nil empty list is an explicit
+	// "no users left" from the panel and must revoke everyone below.
+	if newU == nil {
 		return nil
 	}
 	deleted, added := compareUserList(c.userList, newU)
@@ -233,7 +249,25 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 
 // rollbackNodeReload restores the previous node after a failed reload so it
 // keeps serving instead of staying down until the next panel-side change.
-func (c *Controller) rollbackNodeReload(oldTag string, oldInfo *panel.NodeInfo, oldUserList []panel.UserInfo) {
+// newNodeInCore tells whether the new node (or parts of it) already made it
+// into the core; those resources are removed first — otherwise re-adding the
+// old node fails with a duplicate inbound when the tags match, or leaves the
+// new node behind when they differ. An error return means the core is NOT
+// guaranteed to match the controller state.
+func (c *Controller) rollbackNodeReload(oldTag string, oldInfo *panel.NodeInfo, oldUserList []panel.UserInfo, newNodeInCore bool) error {
+	newTag := c.tag
+	if newNodeInCore {
+		if err := c.server.DelNode(newTag); err != nil {
+			log.WithFields(log.Fields{
+				"tag": newTag,
+				"err": err,
+			}).Warn("Rollback: remove failed new node")
+		}
+	}
+	// Drop the limiter created for the new configuration; when the tags are
+	// equal it is re-created for the old configuration below.
+	limiter.DeleteLimiter(newTag)
+
 	c.tag = oldTag
 	c.info = oldInfo
 	c.userList = oldUserList
@@ -248,8 +282,8 @@ func (c *Controller) rollbackNodeReload(oldTag string, oldInfo *panel.NodeInfo, 
 		log.WithFields(log.Fields{
 			"tag": oldTag,
 			"err": err,
-		}).Error("Rollback: add old node failed")
-		return
+		}).Error("Rollback failed: old node could not be restored")
+		return err
 	}
 	if _, err := c.server.AddUsers(&vCore.AddUsersParams{
 		Tag:      oldTag,
@@ -259,16 +293,17 @@ func (c *Controller) rollbackNodeReload(oldTag string, oldInfo *panel.NodeInfo, 
 		log.WithFields(log.Fields{
 			"tag": oldTag,
 			"err": err,
-		}).Error("Rollback: add old users failed")
+		}).Error("Rollback failed: old users could not be restored")
+		return err
 	}
+	return nil
 }
 
 func (c *Controller) SpeedChecker() error {
 	if c.traffic == nil {
 		return nil
 	}
-	// Snapshot and clear expired entries under the lock; the limiter update
-	// itself does network-free map lookups but keep it out of the lock anyway.
+	// Snapshot and clear expired entries under the lock.
 	c.trafficMu.Lock()
 	over := make([]string, 0)
 	for u, t := range c.traffic {
@@ -278,8 +313,21 @@ func (c *Controller) SpeedChecker() error {
 		}
 	}
 	c.trafficMu.Unlock()
+	if len(over) == 0 {
+		return nil
+	}
+	// Fetch the limiter through the global registry instead of c.limiter:
+	// the node monitor swaps that field during a reload while this task runs.
+	l, err := limiter.GetLimiter(c.tag)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"tag": c.tag,
+			"err": err,
+		}).Error("Get limiter for dynamic speed limit failed")
+		return nil
+	}
 	for _, u := range over {
-		if err := c.limiter.UpdateDynamicSpeedLimit(c.tag, u,
+		if err := l.UpdateDynamicSpeedLimit(c.tag, u,
 			c.LimitConfig.DynamicSpeedLimitConfig.SpeedLimit,
 			time.Now().Add(time.Duration(c.LimitConfig.DynamicSpeedLimitConfig.ExpireTime)*time.Minute)); err != nil {
 			log.WithFields(log.Fields{

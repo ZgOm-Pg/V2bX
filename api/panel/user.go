@@ -87,6 +87,12 @@ func (c *Client) GetUserList() ([]UserInfo, error) {
 		}
 	}
 	c.userEtag = r.Header().Get("ETag")
+	// A 200 response with an empty user list must stay distinguishable from
+	// a 304 (which returns nil, nil): the node monitor relies on nil to mean
+	// "nothing changed" and on a non-nil empty slice to mean "revoke all".
+	if userlist.Users == nil {
+		userlist.Users = make([]UserInfo, 0)
+	}
 	return userlist.Users, nil
 }
 

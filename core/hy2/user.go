@@ -117,11 +117,14 @@ func (h *Hysteria2) RestoreUserTraffic(tag string, traffic []panel.UserTraffic) 
 		return nil
 	}
 	hook := h.Hy2nodes[tag].TrafficLogger.(*HookServer)
-	v, ok := hook.Counter.Load(tag)
+	vc, ok := hook.Counter.Load(tag)
 	if !ok {
-		return nil
+		// Restore must not silently drop the bytes when the counter was
+		// removed in between; recreate it like LogTraffic does.
+		vc = counter.NewTrafficCounter()
+		hook.Counter.Store(tag, vc)
 	}
-	c := v.(*counter.TrafficCounter)
+	c := vc.(*counter.TrafficCounter)
 	for i := range traffic {
 		for uuid, uid := range h.Auth.usersMap {
 			if uid != traffic[i].UID {

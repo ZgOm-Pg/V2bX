@@ -10,19 +10,6 @@ import (
 func (c *Controller) reportUserTrafficTask() (err error) {
 	userTraffic, _ := c.server.GetUserTrafficSlice(c.tag, true)
 	if len(userTraffic) > 0 {
-		// Accumulate for the dynamic speed limit regardless of the report
-		// result, keyed by uuid as SpeedChecker expects.
-		if c.LimitConfig.EnableDynamicSpeedLimit {
-			uidToUuid := make(map[int]string, len(c.userList))
-			for i := range c.userList {
-				uidToUuid[c.userList[i].Id] = c.userList[i].Uuid
-			}
-			for i := range userTraffic {
-				if uuid, ok := uidToUuid[userTraffic[i].UID]; ok {
-					c.addTrafficCounter(uuid, userTraffic[i].Upload+userTraffic[i].Download)
-				}
-			}
-		}
 		if err = c.apiClient.ReportUserTraffic(userTraffic); err != nil {
 			// The counters were already drained; put the bytes back so the
 			// failed report is retried with the next cycle instead of being
@@ -38,6 +25,23 @@ func (c *Controller) reportUserTrafficTask() (err error) {
 				"err": err,
 			}).Info("Report user traffic failed")
 		} else {
+			// Count the drained bytes for the dynamic speed limit only after
+			// the panel acknowledged the report. Accumulating before the
+			// report double-counted bytes that RestoreUserTraffic put back
+			// after a failed report. Trade-off: while reports keep failing,
+			// dynamic limit activation is delayed until the first successful
+			// report; the bytes themselves are never lost.
+			if c.LimitConfig.EnableDynamicSpeedLimit {
+				uidToUuid := make(map[int]string, len(c.userList))
+				for i := range c.userList {
+					uidToUuid[c.userList[i].Id] = c.userList[i].Uuid
+				}
+				for i := range userTraffic {
+					if uuid, ok := uidToUuid[userTraffic[i].UID]; ok {
+						c.addTrafficCounter(uuid, userTraffic[i].Upload+userTraffic[i].Download)
+					}
+				}
+			}
 			log.WithField("tag", c.tag).Infof("Report %d users traffic", len(userTraffic))
 			log.WithField("tag", c.tag).Debugf("User traffic: %+v", userTraffic)
 		}
