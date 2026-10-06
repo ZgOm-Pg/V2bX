@@ -94,6 +94,10 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			// once the reload succeeded
 			c.userListTarget = newU
 			usersToApply = newU
+		} else if c.userListTarget != nil {
+			// 304: no newer list, but a pending target from a failed apply is
+			// still there and must be installed by this reload
+			usersToApply = c.userListTarget
 		}
 		c.info = newN
 		c.resetTrafficCounter()
@@ -117,7 +121,10 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			limiter.DeleteLimiter(oldTag)
 			c.tag = c.buildNodeTag(newN)
 		}
-		c.limiter = limiter.AddLimiter(c.tag, &c.LimitConfig, c.userList, newA)
+		// The limiter must be built from exactly the users that are about to
+		// be installed in the core (usersToApply), otherwise newly added
+		// users pass core auth but are rejected by CheckLimit.
+		c.limiter = limiter.AddLimiter(c.tag, &c.LimitConfig, usersToApply, newA)
 		// Update rule
 		err = c.limiter.UpdateRule(&newN.Rules)
 		if err != nil {
