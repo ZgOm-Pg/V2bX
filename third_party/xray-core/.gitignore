@@ -36,12 +36,16 @@ vprotogen
 errorgen
 !common/errors/errorgen/
 *.dat
+# vendored upstream test fixture (precise exception, do not widen)
+!common/buf/data/*.dat
 
 # Build assets
 /build_assets/
 
 # Output from dlv test
 **/debug.*
+# vendored upstream debug distro source (precise exception, do not widen)
+!main/distro/debug/debug.go
 
 # Certificates and keys
 *.crt
