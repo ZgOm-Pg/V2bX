@@ -1,11 +1,15 @@
 package node
 
 import (
+	"encoding/json"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,6 +47,7 @@ type fakeCore struct {
 	failAddNodePort  int
 	traffic          map[string]int64
 	restored         int
+	addUsersCalls    int
 }
 
 func newFakeCore() *fakeCore {
@@ -88,6 +93,7 @@ func (f *fakeCore) DelNode(tag string) error {
 func (f *fakeCore) AddUsers(p *vCore.AddUsersParams) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.addUsersCalls++
 	if f.failAddUsersPort != 0 && p.NodeInfo != nil && p.NodeInfo.Common != nil &&
 		p.NodeInfo.Common.ServerPort == f.failAddUsersPort {
 		return 0, fmt.Errorf("simulated add users failure for port %d", f.failAddUsersPort)
@@ -139,6 +145,18 @@ func (f *fakeCore) userCount(tag string) int {
 	return len(f.users[tag])
 }
 
+func (f *fakeCore) hasUser(tag, uuid string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.users[tag][uuid]
+}
+
+func (f *fakeCore) addUsersCallsSnapshot() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.addUsersCalls
+}
+
 func (f *fakeCore) nodePort(tag string) (int, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -160,12 +178,19 @@ func (f *fakeCore) pendingTraffic(tag string) int64 {
 const oneUserJSON = `{"users":[{"id":1,"uuid":"u1","speed_limit":0,"device_limit":0}]}`
 
 type fakePanel struct {
-	mu        sync.Mutex
-	nodePort  int
-	usersJSON string
-	userFail  bool
+	mu         sync.Mutex
+	nodePort   int
+	usersJSON  string
+	userFail   bool
 	pushStatus int
-	srv       *httptest.Server
+	// pushAcceptDrop simulates a panel that has already accounted the
+	// reported bytes but whose response never reaches the client: the
+	// request is read, the payload accumulated, and the connection is
+	// closed without any HTTP response.
+	pushAcceptDrop    bool
+	pushRequests      int32
+	pushBytesAccepted int64
+	srv               *httptest.Server
 }
 
 func newFakePanel(t *testing.T) *fakePanel {
@@ -190,7 +215,7 @@ func newFakePanel(t *testing.T) *fakePanel {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("ETag", fmt.Sprintf(`"%x"`, len(body)))
+		w.Header().Set("ETag", fmt.Sprintf(`"%x"`, sha256.Sum256([]byte(body))))
 		if r.Header.Get("If-None-Match") == w.Header().Get("ETag") {
 			w.WriteHeader(http.StatusNotModified)
 			return
@@ -199,9 +224,28 @@ func newFakePanel(t *testing.T) *fakePanel {
 		fmt.Fprint(w, body)
 	})
 	mux.HandleFunc("/api/v1/server/UniProxy/push", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fp.pushRequests, 1)
 		fp.mu.Lock()
-		st := fp.pushStatus
+		st, drop := fp.pushStatus, fp.pushAcceptDrop
 		fp.mu.Unlock()
+		body, _ := io.ReadAll(r.Body)
+		var reported map[string][]int64
+		_ = json.Unmarshal(body, &reported)
+		var sum int64
+		for _, v := range reported {
+			if len(v) == 2 {
+				sum += v[0] + v[1]
+			}
+		}
+		atomic.AddInt64(&fp.pushBytesAccepted, sum)
+		if drop {
+			// accepted-and-accounted, but the response is lost
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, _, _ := hj.Hijack()
+				conn.Close()
+				return
+			}
+		}
 		w.WriteHeader(st)
 	})
 	mux.HandleFunc("/api/v1/server/UniProxy/alivelist", func(w http.ResponseWriter, r *http.Request) {
@@ -580,5 +624,176 @@ func TestZeroUserNodeCanStart(t *testing.T) {
 	c := newTestController(t, fp, core, nil)
 	if got := core.userCount(c.tag); got != 0 {
 		t.Fatalf("users in core = %d, want 0", got)
+	}
+}
+
+// ---- problem 1: report idempotency (documented reproduction, NOT fixed) ----
+
+// Reproduces the double-accounting window: the panel accepts and accumulates
+// the reported delta but the response never reaches the node. Both layers
+// then duplicate the bytes — resty's automatic retry (same report re-sent)
+// and the next reporting cycle (RestoreUserTraffic keeps the bytes so they
+// are re-reported). This test pins the reproduction; a complete fix needs
+// panel-side deduplication and cannot be implemented node-side alone.
+func TestFailedReportDuplicatesPanelAccounting(t *testing.T) {
+	fp := newFakePanel(t)
+	core := newFakeCore()
+	c := newTestController(t, fp, core, func(o *conf.Options) {
+		o.LimitConfig.EnableDynamicSpeedLimit = true
+		o.LimitConfig.DynamicSpeedLimitConfig = &conf.DynamicSpeedLimitConfig{
+			Periodic: 3600, Traffic: 1 << 40, SpeedLimit: 2048, ExpireTime: 60,
+		}
+	})
+	fp.mu.Lock()
+	fp.pushAcceptDrop = true
+	fp.mu.Unlock()
+	core.mu.Lock()
+	core.traffic[c.tag] = 100 // exactly 100 real bytes pending
+	core.mu.Unlock()
+
+	// cycle 1: report dropped after acceptance — resty retries re-send it
+	if err := c.reportUserTrafficTask(); err != nil {
+		t.Fatalf("reportUserTrafficTask: %s", err)
+	}
+	reqs := atomic.LoadInt32(&fp.pushRequests)
+	accepted := atomic.LoadInt64(&fp.pushBytesAccepted)
+	if reqs < 2 {
+		t.Fatalf("panel received %d requests, want >=2 (resty auto-retry layer)", reqs)
+	}
+	if accepted < 200 {
+		t.Fatalf("panel accepted %d bytes for 100 real bytes, want >=200 (duplicate accounting)", accepted)
+	}
+	if got := core.pendingTraffic(c.tag); got != 100 {
+		t.Fatalf("core pending traffic = %d, want 100 (restore must not lose bytes)", got)
+	}
+
+	// cycle 2: the same 100 bytes are reported again (next-cycle layer)
+	if err := c.reportUserTrafficTask(); err != nil {
+		t.Fatalf("reportUserTrafficTask: %s", err)
+	}
+	accepted2 := atomic.LoadInt64(&fp.pushBytesAccepted)
+	if accepted2 < accepted+100 {
+		t.Fatalf("panel total %d did not grow by >=100 on the next cycle", accepted2)
+	}
+	t.Logf("REPRO: 100 real bytes; panel accepted %d bytes over %d requests in 2 cycles", accepted2, atomic.LoadInt32(&fp.pushRequests))
+}
+
+// ---- problem 2: failed user apply must survive 304 ----
+
+func TestAddFailureRetriedAfter304(t *testing.T) {
+	fp := newFakePanel(t)
+	core := newFakeCore()
+	c := newTestController(t, fp, core, nil)
+
+	fp.setUsers(`{"users":[{"id":1,"uuid":"u1"},{"id":2,"uuid":"u2"}]}`)
+	core.mu.Lock()
+	core.failAddUsersPort = c.info.Common.ServerPort
+	core.mu.Unlock()
+	c.nodeInfoMonitor()
+	if got := core.userCount(c.tag); got != 1 {
+		t.Fatalf("users applied during failing add = %d, want 1", got)
+	}
+
+	// panel keeps returning 304 while the add keeps failing
+	c.nodeInfoMonitor()
+	c.nodeInfoMonitor()
+	if got := core.userCount(c.tag); got != 1 {
+		t.Fatalf("users applied across failing 304 cycles = %d, want 1", got)
+	}
+
+	// the blocker disappears: the pending users must be applied without any
+	// new panel change
+	core.mu.Lock()
+	core.failAddUsersPort = 0
+	core.mu.Unlock()
+	c.nodeInfoMonitor()
+	if got := core.userCount(c.tag); got != 2 {
+		t.Fatalf("pending users not applied after recovery: %d, want 2", got)
+	}
+	if core.hasUser(c.tag, "u2") == false {
+		t.Fatal("u2 missing from core after recovery")
+	}
+	l, err := limiter.GetLimiter(c.tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := l.UserLimitInfo.Load(c.tag + "|u2"); !ok {
+		t.Fatal("limiter entry for u2 missing after recovery")
+	}
+
+	// once applied, no redundant AddUsers on further 304 cycles
+	before := core.addUsersCallsSnapshot()
+	c.nodeInfoMonitor()
+	if after := core.addUsersCallsSnapshot(); after != before {
+		t.Fatalf("redundant AddUsers after successful apply: %d -> %d", before, after)
+	}
+	if got := core.userCount(c.tag); got != 2 {
+		t.Fatalf("user count drifted after 304: %d, want 2", got)
+	}
+}
+
+func TestNewer200ListWinsDuringRetry(t *testing.T) {
+	fp := newFakePanel(t)
+	core := newFakeCore()
+	c := newTestController(t, fp, core, nil)
+
+	// target u1+u2 pending; the add fails
+	fp.setUsers(`{"users":[{"id":1,"uuid":"u1"},{"id":2,"uuid":"u2"}]}`)
+	core.mu.Lock()
+	core.failAddUsersPort = c.info.Common.ServerPort
+	core.mu.Unlock()
+	c.nodeInfoMonitor()
+
+	// a newer list revokes u2 before it was ever applied and adds u3
+	fp.setUsers(`{"users":[{"id":1,"uuid":"u1"},{"id":3,"uuid":"u3"}]}`)
+	core.mu.Lock()
+	core.failAddUsersPort = 0
+	core.mu.Unlock()
+	c.nodeInfoMonitor()
+
+	if core.hasUser(c.tag, "u2") {
+		t.Fatal("u2 was applied although the newer list revoked it")
+	}
+	if core.hasUser(c.tag, "u3") == false {
+		t.Fatal("u3 from the newest list was not applied")
+	}
+	if got := core.userCount(c.tag); got != 2 {
+		t.Fatalf("core users = %d, want 2", got)
+	}
+}
+
+func TestPartialDeleteSuccessAddFailureRecovers(t *testing.T) {
+	two := `{"users":[{"id":1,"uuid":"u1"},{"id":2,"uuid":"u2"}]}`
+	fp := newFakePanel(t)
+	fp.setUsers(two)
+	core := newFakeCore()
+	c := newTestController(t, fp, core, nil)
+
+	// target: revoke u1, add u3; the add fails while the delete succeeded
+	fp.setUsers(`{"users":[{"id":2,"uuid":"u2"},{"id":3,"uuid":"u3"}]}`)
+	core.mu.Lock()
+	core.failAddUsersPort = c.info.Common.ServerPort
+	core.mu.Unlock()
+	c.nodeInfoMonitor()
+	if core.hasUser(c.tag, "u1") == true {
+		t.Fatal("u1 should have been deleted")
+	}
+	if got := core.userCount(c.tag); got != 1 {
+		t.Fatalf("core users after partial failure = %d, want 1 (u2)", got)
+	}
+
+	// failure clears: the pending add must be retried on the next 304 cycle
+	core.mu.Lock()
+	core.failAddUsersPort = 0
+	core.mu.Unlock()
+	c.nodeInfoMonitor()
+	if core.hasUser(c.tag, "u3") == false {
+		t.Fatal("pending u3 was not applied on the next cycle")
+	}
+	if core.hasUser(c.tag, "u1") == true {
+		t.Fatal("u1 reappeared")
+	}
+	if got := core.userCount(c.tag); got != 2 {
+		t.Fatalf("core users after recovery = %d, want 2", got)
 	}
 }

@@ -151,11 +151,5 @@ func (c *Client) ReportNodeOnlineUsers(data *map[int][]string) error {
 		SetBody(data).
 		ForceContentType("application/json").
 		Post(path)
-	err = c.checkResponse(r, path, err)
-
-	if err != nil {
-		return nil
-	}
-
-	return nil
+	return c.checkResponse(r, path, err)
 }

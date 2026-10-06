@@ -88,10 +88,14 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		oldTag := c.tag
 		oldInfo := c.info
 		oldUserList := c.userList
-		c.info = newN
+		usersToApply := c.userList
 		if newU != nil {
-			c.userList = newU
+			// fetched list becomes the target; it is only recorded as applied
+			// once the reload succeeded
+			c.userListTarget = newU
+			usersToApply = newU
 		}
+		c.info = newN
 		c.resetTrafficCounter()
 		// Remove old node
 		log.WithField("tag", c.tag).Info("Node changed, reload")
@@ -157,7 +161,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		}
 		_, err = c.server.AddUsers(&vCore.AddUsersParams{
 			Tag:      c.tag,
-			Users:    c.userList,
+			Users:    usersToApply,
 			NodeInfo: newN,
 		})
 		if err != nil {
@@ -168,8 +172,12 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			if rbErr := c.rollbackNodeReload(oldTag, oldInfo, oldUserList, true); rbErr != nil {
 				log.WithFields(log.Fields{"tag": oldTag, "err": rbErr}).Error("Node rollback failed")
 			}
+			// the fetched target stays pending and is retried via the user
+			// diff on the next cycle
 			return nil
 		}
+		c.userList = usersToApply
+		c.userListTarget = nil
 		// Check interval
 		if c.nodeInfoMonitorPeriodic.Interval != newN.PullInterval &&
 			newN.PullInterval != 0 {
@@ -187,13 +195,18 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	if newA != nil {
 		c.limiter.SetAliveList(newA)
 	}
-	// node not changed; nil means the panel reported no update (304), so the
-	// current user set stays valid. A non-nil empty list is an explicit
-	// "no users left" from the panel and must revoke everyone below.
-	if newU == nil {
+	// A non-nil fetched list is the new target state; a 304 (nil) keeps any
+	// target that has not been applied yet, so a failed apply is retried on
+	// the following cycles instead of being lost until the next panel change.
+	if newU != nil {
+		c.userListTarget = newU
+	}
+	target := c.userListTarget
+	if target == nil {
+		// 304 and nothing pending: the applied user set stays valid
 		return nil
 	}
-	deleted, added := compareUserList(c.userList, newU)
+	deleted, added := compareUserList(c.userList, target)
 	if len(deleted) > 0 {
 		// have deleted users
 		err = c.server.DelUsers(deleted, c.tag, c.info)
@@ -202,7 +215,20 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				"tag": c.tag,
 				"err": err,
 			}).Error("Delete users failed")
+			// target is kept pending; retried on the next cycle
 			return nil
+		}
+		// record the deletion even if the adds below fail, so the next cycle
+		// does not re-delete users the core no longer has
+		c.userList = removeFromUserList(c.userList, deleted)
+		// keep the limiter in sync incrementally
+		c.limiter.UpdateUser(c.tag, nil, deleted)
+		if c.LimitConfig.EnableDynamicSpeedLimit {
+			c.trafficMu.Lock()
+			for i := range deleted {
+				delete(c.traffic, deleted[i].Uuid)
+			}
+			c.trafficMu.Unlock()
 		}
 	}
 	if len(added) > 0 {
@@ -217,34 +243,44 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				"tag": c.tag,
 				"err": err,
 			}).Error("Add users failed")
+			// the applied deletions are recorded; the pending adds are
+			// retried on the next cycle
 			return nil
 		}
+		c.userList = appendToUserList(c.userList, added)
+		c.limiter.UpdateUser(c.tag, added, nil)
 	}
-	if len(added) > 0 || len(deleted) > 0 {
-		// update Limiter
-		c.limiter.UpdateUser(c.tag, added, deleted)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"tag": c.tag,
-				"err": err,
-			}).Error("limiter users failed")
-			return nil
-		}
-		// clear traffic record
-		if c.LimitConfig.EnableDynamicSpeedLimit {
-			c.trafficMu.Lock()
-			for i := range deleted {
-				delete(c.traffic, deleted[i].Uuid)
-			}
-			c.trafficMu.Unlock()
-		}
-	}
-	c.userList = newU
+	// target fully applied
+	c.userListTarget = nil
 	if len(added)+len(deleted) != 0 {
 		log.WithField("tag", c.tag).
 			Infof("%d user deleted, %d user added", len(deleted), len(added))
 	}
 	return nil
+}
+
+// removeFromUserList returns the list without the removed users (matched by
+// Uuid+Id identity), recording partial apply progress across failed cycles.
+func removeFromUserList(list []panel.UserInfo, removed []panel.UserInfo) []panel.UserInfo {
+	gone := make(map[string]bool, len(removed))
+	for i := range removed {
+		gone[removed[i].Uuid] = true
+	}
+	out := make([]panel.UserInfo, 0, len(list))
+	for _, u := range list {
+		if !gone[u.Uuid] {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// appendToUserList returns the list plus the added users.
+func appendToUserList(list []panel.UserInfo, added []panel.UserInfo) []panel.UserInfo {
+	out := make([]panel.UserInfo, 0, len(list)+len(added))
+	out = append(out, list...)
+	out = append(out, added...)
+	return out
 }
 
 // rollbackNodeReload restores the previous node after a failed reload so it

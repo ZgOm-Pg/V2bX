@@ -20,6 +20,10 @@ type Controller struct {
 	trafficMu                 sync.Mutex
 	traffic                   map[string]int64
 	userList                  []panel.UserInfo
+	// userListTarget is the last successfully fetched panel user list that
+	// has not been applied to the core yet (nil = everything applied). It
+	// survives 304 cycles so a failed apply is retried on the next tick.
+	userListTarget            []panel.UserInfo
 	aliveMap                  map[int]int
 	info                      *panel.NodeInfo
 	nodeInfoMonitorPeriodic   *task.Task
